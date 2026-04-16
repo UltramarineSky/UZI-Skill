@@ -628,13 +628,41 @@ def generate_synthesis(raw: dict, dims_scored: dict, panel: dict) -> dict:
     else:
         punchline = f"{name} · ROE 历史与当前估值存在结构性分歧，等待方向明朗。"
 
-    # Risks
+    # Risks — generated from low-scoring dimensions + institutional modeling
     risks = []
     for key, dim in dims_scored["dimensions"].items():
         if dim["score"] <= 4:
-            risks.extend(dim.get("reasons_fail", [])[:1])
+            reasons = dim.get("reasons_fail", [])
+            if reasons:
+                risks.extend(reasons[:1])
+            else:
+                # Use dim name as fallback
+                dim_name = dim.get("name") or dim.get("label") or key
+                risks.append(f"{dim_name} 评分偏低 ({dim['score']}/10)")
+
+    # If still empty, generate dynamic risks from actual data instead of hardcoded ones
     if not risks:
-        risks = ["估值偏高", "苹果订单依赖度偏高", "行业竞争加剧"]
+        pe_val = features.get("pe", 0) if "features" in dir() else 0
+        debt_val = features.get("debt_ratio", 0) if "features" in dir() else 0
+        # Use features from extract_features if available
+        try:
+            _f = extract_features(raw, raw.get("dimensions", {}))
+            pe_val = _f.get("pe", 0)
+            debt_val = _f.get("debt_ratio", 0)
+            roe_min = _f.get("roe_5y_min", 0)
+            industry = _f.get("industry", "所属行业")
+        except Exception:
+            pe_val, debt_val, roe_min, industry = 0, 0, 0, "所属行业"
+
+        if pe_val > 30:
+            risks.append(f"当前 PE {pe_val:.0f}x，估值偏高")
+        if debt_val > 50:
+            risks.append(f"资产负债率 {debt_val:.0f}%，财务杠杆偏高")
+        if roe_min < 5:
+            risks.append(f"ROE 最低 {roe_min:.1f}%，盈利稳定性不足")
+        risks.append(f"{industry}行业竞争加剧风险")
+        risks.append("宏观经济或政策环境变化")
+
     risks = risks[:5]
 
     # Friendly layer
@@ -733,7 +761,11 @@ def generate_synthesis(raw: dict, dims_scored: dict, panel: dict) -> dict:
             "intelligence": {
                 "news": "近期新闻 + 公告已采集",
                 "risks": risks[:3],
-                "catalysts": ["季报", "新品"],
+                "catalysts": [
+                    e.get("event", "季报")[:30]
+                    for e in ((d21.get("catalyst_calendar") or {}).get("events") or [])
+                    if e.get("impact") in ("high", "medium")
+                ][:3] or ["季报窗口", "行业事件"],
             },
             "battle_plan": {
                 "entry": f"¥{round(price * 0.92, 2) if price else '—'}",
