@@ -137,28 +137,73 @@ python run.py <股票> --no-browser
 - 有多少个 fallback 维度
 - Task 1.5 的核心输出预览
 
-### 🧠 数据质量审查（至关重要！）
+### 🧠 逐维数据质量审查（每一步都必须 agent 介入）
 
-**脚本只是第一道搜集**。你必须在 Task 1 完成后**亲自审查以下维度的数据质量**：
+<HARD-GATE>
+Do NOT proceed to Stage 2 until you have personally inspected EVERY dimension's data
+and fixed any garbage. Scripts collect data, YOU guarantee quality.
+If a dimension has irrelevant content (city tourism guides for a stock analysis),
+you MUST re-search and replace the data yourself.
+</HARD-GATE>
 
-1. **护城河 (dim 14_moat)** — 看 `intangible` / `switching` / `network` / `scale` 的文字内容。如果出现"拼音"、"甲骨文"、"常用字"等字典释义，说明搜索结果是字典页面而不是公司分析。**你必须用 web search 重新搜**：
-   ```
-   "{company_name} 竞争优势 核心技术 市场份额 壁垒"
-   ```
-   然后用搜索结果覆盖 raw_data 中的垃圾文字。
+**脚本只是第一道粗搜**。DuckDuckGo 中文搜索经常返回无关结果（搜"宁波建工"返回"宁波旅游攻略"）。你必须**逐维审查 + 修复**：
 
-2. **事件驱动 (dim 15_events)** — 看 `event_timeline` 里的标题。如果全是"科创板主力资金净流出"、"行业资金流向日报"等**板块级噪音**而没有公司特定事件（合同、研发突破、管理层变动、产品发布），**你必须用 web search 补充**：
-   ```
-   "{company_name} 最新动态 合同 研发 产品 突破 合作"
-   ```
+#### 审查清单（每条都要过）
 
-3. **上下游 (dim 5_chain)** — 看 `downstream` 描述是否完整。如果文字被截断或不通顺，重写为简洁的"下游客户行业"描述。
+| 维度 | 检查什么 | 垃圾特征 | 你怎么修 |
+|---|---|---|---|
+| **0_basic** | name/industry 是否正确 | industry=None | 你 web search `"{code} 所属行业 主营业务"` 补上 |
+| **5_chain** | upstream/downstream 是否是这家公司的 | 文字截断或无关 | web search `"{name} 上游供应商 下游客户"` 重写 |
+| **7_industry** | 行业增速/TAM 有没有数据 | 全是默认值或空 | web search `"{industry} 行业规模 增速 2026"` |
+| **8_materials** | 原材料描述是否相关 | 和主营无关 | web search `"{name} 原材料 成本构成"` |
+| **13_policy** | 政策是否与该公司/行业相关 | 搜到无关政策 | web search `"{industry} 最新政策 2026"` |
+| **14_moat** | 文字是否是公司分析 | 出现"拼音"、"字典释义"、"汉字演变" | web search `"{name} 竞争优势 核心技术 壁垒"` |
+| **15_events** | 事件是否与这家公司相关 | "如何评价宁波"、"宁波旅游"、城市生活指南 | web search `"{name} {code} 最新公告 合同 中标 研发"` |
+| **17_sentiment** | 舆情是否在说这家公司 | 短公司名匹配到同名无关内容 | web search `"site:xueqiu.com {name} 股票"` |
+| **3_macro** | 宏观环境描述是否有内容 | 全是空或默认 | web search `"中国 {industry} 宏观环境 利率 2026"` |
+| **同行对比** | similar_stocks 是否同行业 | 建筑股配了光学同行 | 检查行业是否正确，手动指定正确同行 |
 
-4. **舆情 (dim 17_sentiment)** — 看 `platform_snippets` 里的内容是否真的是关于这家公司。短公司名（如"国盾"）容易匹配到不相关结果。
+#### 审查流程
 
-5. **所有 web search 维度** — 任何维度如果搜索结果看起来与公司主营业务无关（比如量子通信公司的护城河分析里出现了汉字学解释），都需要你主动重搜。
+```
+for each dimension in raw_data.dimensions:
+    1. 读数据 → 肉眼扫一遍文字内容
+    2. if 内容与公司主营无关 or 明显是垃圾:
+        → web search 重新搜（用公司名 + 行业关键词）
+        → 用搜索结果替换 raw_data 中的内容
+    3. if 数据完全缺失:
+        → web search 补充
+        → 如果搜不到 → 在报告中标注"数据缺失"而非留空
+    4. if 数据看起来合理:
+        → 通过，下一个维度
+```
 
-**规则**：**脚本提供初始数据，你负责质量保证**。不合理的数据宁可用你自己的 web search 替换，也不能原样放进报告。这是分析师的职责。
+#### 重搜模板
+
+当你发现某个维度数据有问题时，用 web search 重搜：
+
+**事件驱动**（最容易出垃圾）：
+```
+搜索 "{公司全称} {股票代码} 最新公告 合同中标 研发进展 2026"
+不要搜 "{城市名}"——只搜公司名和代码
+```
+
+**宏观环境**（脚本经常搜不到）：
+```
+搜索 "中国 {行业} 宏观环境 利率政策 景气度 2026"
+```
+
+**护城河**（容易搜到字典页）：
+```
+搜索 "{公司名} 核心竞争力 技术壁垒 市场份额 护城河"
+```
+
+**舆情**（短名容易误匹配）：
+```
+搜索 "site:xueqiu.com {股票代码}" 或 "site:guba.eastmoney.com {股票代码}"
+```
+
+**原则：脚本是你的数据采集助手，但你是质量把关人。垃圾数据进报告 = 你的失职。**
 
 ### 🧠 你的判断环节（Task 1.5 假设审查）
 
