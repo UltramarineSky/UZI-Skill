@@ -47,43 +47,46 @@ A 股 / 港股 / 美股 · 个股深度分析引擎
 
 ## 安装
 
-### Claude Code（推荐）
+### Claude Code（Plugin 方式）
 
 ```bash
-# 添加 marketplace
 /plugin marketplace add wbh604/UZI-Skill
-
-# 安装
-/plugin install stock-deep-analyzer@float-future-stock-analyzer
+/plugin install stock-deep-analyzer@uzi-skill
 ```
 
-### Codex / 其他 Agent（Skills 方式）
-
-如果你用 OpenAI Codex、Devin 或其他支持 Skills 的 agent，可以直接引用 skill 文件：
+### Claude Code（Skill 方式）
 
 ```bash
-# 克隆仓库
+git clone https://github.com/wbh604/UZI-Skill.git && pip install -r UZI-Skill/requirements.txt
+```
+然后在 Claude Code 里直接打开 UZI-Skill 目录，skills 会被自动发现。
+
+### Codex
+
+在 Codex 环境里跑这一句：
+
+```
+git clone https://github.com/wbh604/UZI-Skill.git && pip install -r UZI-Skill/requirements.txt && python UZI-Skill/skills/deep-analysis/scripts/run_real_test.py 002273.SZ
+```
+
+或者把这段话直接扔给 Codex：
+
+> 帮我克隆 https://github.com/wbh604/UZI-Skill ，安装 requirements.txt，然后用里面的 `skills/deep-analysis/scripts/run_real_test.py` 分析 002273.SZ（水晶光电），把生成的 HTML 报告路径给我。
+
+### Cursor / Windsurf / Devin / 其他 Agent
+
+把这段丢进去就行：
+
+> 读 https://github.com/wbh604/UZI-Skill 里的 `skills/deep-analysis/SKILL.md`，按里面写的 6 个 Task 流程帮我分析一只 A 股。代码在 `skills/deep-analysis/scripts/` 目录下，先 `pip install -r requirements.txt` 装依赖。
+
+### 纯命令行（不用任何 Agent）
+
+```bash
 git clone https://github.com/wbh604/UZI-Skill.git
-
-# 把 skills/ 目录链接到你的 agent 工作区
-# Codex:
-cp -r UZI-Skill/skills/ .claude/skills/
-
-# 或直接在 agent 配置里引用 SKILL.md 路径
-# skills/deep-analysis/SKILL.md  ← 主分析工作流
-# skills/investor-panel/SKILL.md ← 51 评委规则引擎
-# skills/lhb-analyzer/SKILL.md   ← 龙虎榜游资匹配
-# skills/trap-detector/SKILL.md  ← 杀猪盘检测
-```
-
-### Python 依赖
-
-```bash
 cd UZI-Skill
 pip install -r requirements.txt
-
-# 如果要生成朋友圈 PNG（可选）
-playwright install chromium
+python skills/deep-analysis/scripts/run_real_test.py 002273.SZ
+# 报告输出在 skills/deep-analysis/scripts/reports/
 ```
 
 ---
