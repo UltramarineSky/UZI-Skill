@@ -28,42 +28,50 @@ from typing import Any
 # "A+HK" = A 股 + 港股, etc.
 
 MARKET_SCOPE: dict[str, str] = {
-    # Group A · Classic Value — 主看美股，也看全球
-    "buffett": "US+HK",      # 伯克希尔主要持仓美股，也有比亚迪(HK)
-    "graham": "US",           # 纯美股时代
-    "fisher": "US",
-    "munger": "US+HK+A",     # 芒格投了阿里/比亚迪，对A股有了解
-    "templeton": "all",       # 全球投资先驱
-    "klarman": "US",
+    # ═══════════════════════════════════════════════════════
+    # 设计原则:
+    #   - 投资方法论是通用的（巴菲特的 ROE 标准对 A 股同样有效）
+    #   - 只有"交易执行"有市场限制的才 skip（游资只做 A 股 T+1 打板）
+    #   - 大多数投资者 → "all"（可以评价任何市场的股票）
+    # ═══════════════════════════════════════════════════════
 
-    # Group B · Growth
-    "lynch": "US",
-    "oneill": "US",           # CANSLIM 纯美股
-    "thiel": "US",            # 硅谷 VC 视角
-    "wood": "all",             # ARK 主要美股，但看全球颠覆式创新赛道
+    # Group A · Classic Value — 方法论全球通用
+    "buffett": "all",         # ROE/护城河/现金流 哪里都适用，实际也买了比亚迪(HK)
+    "graham": "all",          # PE/PB/安全边际 是数学，不分市场
+    "fisher": "all",          # 15 要点评估框架，全球通用
+    "munger": "all",          # 好生意+好价格+好管理，全球通用
+    "templeton": "all",       # 全球逆向投资先驱
+    "klarman": "all",         # 安全边际哪里都能算
 
-    # Group C · Macro/Hedge — 全球宏观
+    # Group B · Growth — 方法论全球通用
+    "lynch": "all",           # PEG / tenbagger 逻辑全球通用
+    "oneill": "all",          # CANSLIM 7 因子哪个市场都能跑
+    "thiel": "all",           # 0到1 垄断判断全球通用
+    "wood": "all",            # 颠覆式创新 5 平台全球通用
+
+    # Group C · Macro/Hedge — 天然全球视角
     "soros": "all",
     "dalio": "all",
-    "marks": "US",
+    "marks": "all",           # 市场周期判断全球通用
     "druck": "all",
     "robertson": "all",
 
-    # Group D · Technical — 纯图表，市场无关
+    # Group D · Technical — 图表不分国界
     "livermore": "all",
-    "minervini": "US",
+    "minervini": "all",       # Stage Analysis 全球通用
     "darvas": "all",
     "gann": "all",
 
-    # Group E · China Value — 看 A 股 + 部分港美
-    "duan": "US+HK+A",       # 段永平：苹果/腾讯/茅台都买
-    "zhangkun": "A+HK",      # 张坤：A股+港股基金
-    "zhushaoxing": "A",       # 朱少醒：纯A股基金
-    "xiezhiyu": "A+HK",
-    "fengliu": "A+HK",       # 冯柳：高毅A+HK
-    "dengxiaofeng": "A+HK",
+    # Group E · China Value — 方法论通用，但更熟悉中国市场
+    "duan": "all",            # 段永平：苹果/腾讯/茅台都买，全球视野
+    "zhangkun": "all",        # 方法论通用，只是基金合同限制A+HK
+    "zhushaoxing": "all",     # 方法论通用
+    "xiezhiyu": "all",
+    "fengliu": "all",         # 弱者体系全球通用
+    "dengxiaofeng": "all",
 
-    # Group F · 游资 — 只做 A 股！！
+    # Group F · 游资 — 【唯一需要市场限制的群体】
+    # 游资的方法论(打板/龙虎榜/T+1/涨停板)只在 A 股有效
     "zhang_mz": "A", "zhao_lg": "A", "fs_wyj": "A", "bj_cj": "A",
     "yangjia": "A", "sun_ge": "A", "chen_xq": "A", "hu_jl": "A",
     "fang_xx": "A", "zuoshou": "A", "xiao_ey": "A", "jiao_yy": "A",
