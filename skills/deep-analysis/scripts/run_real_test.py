@@ -59,27 +59,83 @@ FETCHER_MAP = [
 ]
 
 
+# v2.6 · mini_racer (V8 isolate) 不是 thread-safe，多线程同时初始化会触发
+# `Check failed: !pool->IsInitialized()` 致命错误。已知用 mini_racer 的 akshare 函数：
+#   - fetch_industry → ak.stock_industry_pe_ratio (cninfo)
+#   - fetch_capital_flow → ak.stock_individual_fund_flow (em fund flow)
+#   - fetch_valuation → ak.stock_a_pe_and_pb (lg)
+# 给这些 fetcher 加共享锁，强制串行化，其他 fetcher 仍并行。
+import threading as _threading
+_MINI_RACER_FETCHERS = {"fetch_industry", "fetch_capital_flow", "fetch_valuation"}
+_MINI_RACER_LOCK = _threading.Lock()
+
+
 def run_fetcher(module_name: str, args: tuple) -> dict:
     try:
         mod = __import__(module_name)
-        result = mod.main(*args)
+        if module_name in _MINI_RACER_FETCHERS:
+            with _MINI_RACER_LOCK:
+                result = mod.main(*args)
+        else:
+            result = mod.main(*args)
         return result if isinstance(result, dict) else {"data": result}
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return {"data": {}, "source": module_name, "fallback": True, "error": f"{type(e).__name__}: {e}"}
 
 
-def collect_raw_data(ticker: str, max_workers: int = 6) -> dict:
+def collect_raw_data(ticker: str, max_workers: int = 6, resume: bool = True) -> dict:
     """Parallel fetcher execution via ThreadPoolExecutor.
 
     Strategy: run fetch_basic first (others depend on industry etc), then
     spawn all remaining fetchers in parallel. Bonus fetchers (fund_holders,
     similar_stocks) run in a second wave since they depend on base cache.
+
+    v2.6 · resume mode: if `.cache/{ticker}/raw_data.json` already exists,
+    skip dims that already have valid data. Realtime dims (price snapshots)
+    are always re-fetched. Use `resume=False` (or env UZI_NO_RESUME=1) to
+    force full re-fetch.
     """
+    # v2.6 · 允许通过 env 关闭 resume（run.py --no-resume 设置）
+    if os.environ.get("UZI_NO_RESUME") == "1":
+        resume = False
     from datetime import datetime as _dt
     raw = {"ticker": ticker, "market": "A", "fetched_at": _dt.now().isoformat(timespec="seconds")}
     dims: dict = {}
     t0 = time.time()
+
+    # v2.6 · resume: 加载已有 raw_data.json 中的 dim 缓存
+    cached_dims: dict = {}
+    if resume:
+        from lib.cache import read_task_output as _read_cache
+        # 尝试用原始 ticker 和可能的 resolved ticker 都查
+        prev = _read_cache(ticker, "raw_data")
+        if prev and isinstance(prev.get("dimensions"), dict):
+            cached_dims = prev["dimensions"]
+            valid_count = sum(
+                1 for d in cached_dims.values()
+                if isinstance(d, dict)
+                and d.get("data")
+                and not d.get("_timeout")
+                and not d.get("error")
+            )
+            if valid_count > 0:
+                print(f"  [resume] 检测到已有缓存 · {valid_count}/{len(cached_dims)} 维有效，跳过这些 fetcher")
+                print(f"           （用 --no-resume 强制重抓）")
+
+    # 哪些 dim 总是重抓（实时数据）
+    REALTIME_DIMS = {"0_basic"}  # basic 含 price/change_pct 必须 fresh
+    # （2_kline 是 daily snapshot，可以 resume；其他 dim 全部 daily/quarterly TTL）
+
+    def _is_dim_cached_valid(dim_key: str) -> bool:
+        if not resume:
+            return False
+        if dim_key in REALTIME_DIMS:
+            return False
+        d = cached_dims.get(dim_key)
+        if not isinstance(d, dict):
+            return False
+        return bool(d.get("data")) and not d.get("_timeout") and not d.get("error")
 
     # ── Wave 1: fetch_basic (串行, 后续 fetcher 依赖它拿 industry) ──
     print("  [wave 1] fetch_basic ...", end="", flush=True)
@@ -99,9 +155,31 @@ def collect_raw_data(ticker: str, max_workers: int = 6) -> dict:
         raw["market"] = dims["0_basic"].get("data", {}).get("market", "A")
 
     # ── Wave 2: all other 19 fetchers in parallel ──
-    print(f"  [wave 2] 19 fetchers parallel (max_workers={max_workers})...")
+    # v2.6 · 加 per-fetcher timeout + overall timeout 防止 hang 卡死整条流水线
+    # v2.6 · resume: 已缓存有效的 dim 直接复用，不重新调 fetcher
     wave2_start = time.time()
-    others = [(m, d, a) for m, d, a in FETCHER_MAP if d != "0_basic"]
+    all_others = [(m, d, a) for m, d, a in FETCHER_MAP if d != "0_basic"]
+    # 分流
+    others = []
+    skipped_cached = []
+    for m, d, a in all_others:
+        if _is_dim_cached_valid(d):
+            dims[d] = cached_dims[d]
+            skipped_cached.append(d)
+        else:
+            others.append((m, d, a))
+    if skipped_cached:
+        print(f"  [resume] 跳过 {len(skipped_cached)} 个已缓存维度: {', '.join(skipped_cached[:5])}{'...' if len(skipped_cached) > 5 else ''}")
+    print(f"  [wave 2] {len(others)}/{len(all_others)} fetchers parallel (max_workers={max_workers}, per-fetcher 90s)...")
+
+    # 长尾 fetcher 给更长 timeout（拉研报 / 拉公告 通常较慢）
+    PER_FETCHER_TIMEOUT_OVERRIDES = {
+        "6_research": 180,    # akshare research_report 拉 30+ 篇
+        "1_financials": 150,  # 多张财报合并
+        "10_valuation": 150,  # 历史估值分位计算
+        "15_events": 120,     # 公告 + web search
+    }
+    DEFAULT_PER_FETCHER_TIMEOUT = 90
 
     def _run_one(item):
         mod_name, dim_key, args_fn = item
@@ -110,19 +188,69 @@ def collect_raw_data(ticker: str, max_workers: int = 6) -> dict:
         result = run_fetcher(mod_name, args)
         return dim_key, mod_name, result, time.time() - t
 
+    from concurrent.futures import TimeoutError as _FutureTimeout
+    # v2.6 · 增量持久化：每完成 N 个 fetcher 写一次 raw_data.json，crash/Ctrl+C 后 --resume 可续
+    from lib.cache import write_task_output as _write_cache
+    INCREMENTAL_SAVE_EVERY = 3
+    completed_count = 0
+    def _persist_progress():
+        raw["dimensions"] = dims
+        try:
+            _write_cache(ticker, "raw_data", raw)
+        except Exception:
+            pass
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_run_one, it): it for it in others}
-        for fut in as_completed(futures):
-            try:
-                dim_key, mod_name, result, elapsed = fut.result()
-                dims[dim_key] = result
-                err = result.get("error") if isinstance(result, dict) else None
-                has_data = bool(result.get("data")) if isinstance(result, dict) else False
-                status = "✗" if err else ("✓" if has_data else "·")
-                tail = f" {err[:60]}" if err else ""
-                print(f"    {status} {dim_key:18} ({elapsed:5.1f}s){tail}")
-            except Exception as e:
-                print(f"    ✗ fetcher crash: {e}")
+        # 整体 5 分钟硬上限；as_completed 内部按 future 自己 result(timeout=)
+        try:
+            for fut in as_completed(futures, timeout=300):
+                item = futures[fut]
+                _, dim_key_pending, _ = item
+                fetcher_timeout = PER_FETCHER_TIMEOUT_OVERRIDES.get(dim_key_pending, DEFAULT_PER_FETCHER_TIMEOUT)
+                try:
+                    dim_key, mod_name, result, elapsed = fut.result(timeout=fetcher_timeout)
+                    dims[dim_key] = result
+                    err = result.get("error") if isinstance(result, dict) else None
+                    has_data = bool(result.get("data")) if isinstance(result, dict) else False
+                    status = "✗" if err else ("✓" if has_data else "·")
+                    tail = f" {err[:60]}" if err else ""
+                    print(f"    {status} {dim_key:18} ({elapsed:5.1f}s){tail}")
+                    completed_count += 1
+                    if completed_count % INCREMENTAL_SAVE_EVERY == 0:
+                        _persist_progress()
+                except _FutureTimeout:
+                    # 单 fetcher 超时 — 标记为超时维度，不影响其他 fetcher
+                    dims[dim_key_pending] = {
+                        "data": {},
+                        "_timeout": True,
+                        "fallback": True,
+                        "error": f"fetcher timeout > {fetcher_timeout}s",
+                        "source": "timeout"
+                    }
+                    print(f"    ⏱  {dim_key_pending:18} (>{fetcher_timeout}s · TIMEOUT · agent 可补抓)")
+                except Exception as e:
+                    dims[dim_key_pending] = {
+                        "data": {},
+                        "fallback": True,
+                        "error": f"{type(e).__name__}: {str(e)[:120]}",
+                        "source": "crash"
+                    }
+                    print(f"    ✗ {dim_key_pending:18} crash: {type(e).__name__}: {str(e)[:60]}")
+        except _FutureTimeout:
+            # 整体 5 分钟超时 — 记录还没完成的 fetcher
+            unfinished = [futures[f] for f in futures if not f.done()]
+            for item in unfinished:
+                _, dim_key_pending, _ = item
+                if dim_key_pending not in dims:
+                    dims[dim_key_pending] = {
+                        "data": {},
+                        "_timeout": True,
+                        "fallback": True,
+                        "error": "wave2 overall timeout > 300s",
+                        "source": "timeout"
+                    }
+            print(f"    ⏱  wave2 整体超时 · 未完成 {len(unfinished)} 个 fetcher 已标记")
     wave2_elapsed = time.time() - wave2_start
     print(f"  [wave 2] done in {wave2_elapsed:.1f}s")
 
@@ -146,12 +274,29 @@ def collect_raw_data(ticker: str, max_workers: int = 6) -> dict:
         except Exception as e:
             return ("similar_stocks", [], str(e))
 
+    # v2.6 · wave3 同样加 60s timeout per fetcher（fund_holders 默认抓全量，可能慢）
+    from concurrent.futures import TimeoutError as _FutureTimeout
     with ThreadPoolExecutor(max_workers=2) as pool:
-        for fut in as_completed([pool.submit(_fund_holders), pool.submit(_similar_stocks)]):
-            key, val, err = fut.result()
-            raw[key] = val
-            status = "✗" if err else "✓"
-            print(f"    {status} {key}: {len(val) if isinstance(val, list) else 'n/a'}")
+        wave3_futures = {pool.submit(_fund_holders): "fund_managers", pool.submit(_similar_stocks): "similar_stocks"}
+        try:
+            for fut in as_completed(wave3_futures, timeout=180):
+                key_pending = wave3_futures[fut]
+                try:
+                    key, val, err = fut.result(timeout=120)
+                    raw[key] = val
+                    status = "✗" if err else "✓"
+                    print(f"    {status} {key}: {len(val) if isinstance(val, list) else 'n/a'}")
+                except _FutureTimeout:
+                    raw[key_pending] = []
+                    print(f"    ⏱  {key_pending} (>120s · TIMEOUT)")
+                except Exception as e:
+                    raw[key_pending] = []
+                    print(f"    ✗ {key_pending} crash: {type(e).__name__}: {str(e)[:60]}")
+        except _FutureTimeout:
+            for f, k in wave3_futures.items():
+                if not f.done() and k not in raw:
+                    raw[k] = []
+            print(f"    ⏱  wave3 overall timeout")
     wave3_elapsed = time.time() - wave3_start
     print(f"  [wave 3] done in {wave3_elapsed:.1f}s")
 
@@ -569,34 +714,38 @@ def generate_synthesis(raw: dict, dims_scored: dict, panel: dict, agent_analysis
     # Pick bull and bear for great divide
     # CRITICAL: must pick from ACTUALLY bullish/bearish investors, never misattribute
     investors = panel.get("investors", [])
-    inv_by_score = sorted(investors, key=lambda x: -x.get("score", 0))
 
-    # Bull = highest score among genuinely bullish, or highest score overall if no bullish
-    bulls = [i for i in investors if i["signal"] == "bullish"]
-    bears = [i for i in investors if i["signal"] == "bearish"]
-    neutrals = [i for i in investors if i["signal"] == "neutral"]
+    # v2.6 · 防御性 panel 排序 (fix bug #5: "最看空 27 vs 下面 0 不一致")
+    # 非 Claude LLM 可能写出 signal=bullish 但 score=5 这种自相矛盾输出。
+    # 旧逻辑按 signal 先分组再选 → 实际可见的最低分(neutral/skip 里 0 分的)反而没被选为 bear。
+    # 新逻辑：先排除 skip 和明显异常（score=0 通常是空数据），然后按 score 排序，
+    #        bull = 最高分 · bear = 最低分。signal 仅作辅助检查。
+    eligible = [
+        i for i in investors
+        if i.get("signal") != "skip"
+        and i.get("score", 0) > 0  # 0 分通常是 fail_msg 幻觉，剔除
+    ]
+    if not eligible:
+        eligible = [i for i in investors if i.get("signal") != "skip"] or investors
 
-    if bulls:
-        bull = sorted(bulls, key=lambda x: -x.get("score", 0))[0]
-    elif neutrals:
-        # No bullish → pick highest-scoring neutral as "relative bull"
-        bull = sorted(neutrals, key=lambda x: -x.get("score", 0))[0]
-    else:
-        # Everyone is bearish → pick least bearish
-        bull = inv_by_score[0]
-
-    if bears:
-        bear = sorted(bears, key=lambda x: x.get("score", 100))[0]
-    elif neutrals:
-        # No bearish → pick lowest-scoring neutral as "relative bear"
-        bear = sorted(neutrals, key=lambda x: x.get("score", 100))[0]
-    else:
-        # Everyone is bullish → pick least bullish
-        bear = inv_by_score[-1]
+    inv_by_score = sorted(eligible, key=lambda x: -x.get("score", 0))
+    bull = inv_by_score[0] if inv_by_score else (investors[0] if investors else {})
+    bear = inv_by_score[-1] if inv_by_score else (investors[-1] if investors else {})
 
     # Safety: bull and bear must be different investors
-    if bull["investor_id"] == bear["investor_id"] and len(investors) > 1:
-        bear = inv_by_score[-1] if bull == inv_by_score[0] else inv_by_score[0]
+    if bull.get("investor_id") == bear.get("investor_id") and len(inv_by_score) > 1:
+        bear = inv_by_score[-2]
+
+    # v2.6 · Sanity warnings: signal vs score 矛盾时打印（不阻断流程）
+    def _check_signal_score(inv: dict, role: str) -> None:
+        sig = inv.get("signal", "")
+        sc = inv.get("score", 50)
+        if role == "bull" and sig == "bearish":
+            print(f"   ⚠️ Top bull '{inv.get('name')}' signal=bearish but score={sc} → 数据可能错乱")
+        if role == "bear" and sig == "bullish":
+            print(f"   ⚠️ Bottom bear '{inv.get('name')}' signal=bullish but score={sc} → 数据可能错乱")
+    _check_signal_score(bull, "bull")
+    _check_signal_score(bear, "bear")
 
     # Build debate rounds — use actual headline + reasoning from evaluator
     bull_headline = bull.get("headline", bull.get("comment", ""))
@@ -999,6 +1148,32 @@ def stage2(ticker: str) -> str:
 
     # v2.2 · Read agent_analysis.json — the agent's written-back analysis
     agent_analysis = read_task_output(ti.full, "agent_analysis")
+
+    # v2.6 · 校验 agent_analysis schema（特别针对非 Claude 模型的输出）
+    if agent_analysis:
+        try:
+            from lib.agent_analysis_validator import validate as _validate_aa, format_issues as _fmt_aa
+            issues = _validate_aa(agent_analysis)
+            errs = [i for i in issues if i.severity == "error"]
+            if issues:
+                print("\n" + _fmt_aa(issues))
+                # 写错误清单 JSON 给 agent 复盘
+                from pathlib import Path as _Path
+                err_path = _Path(".cache") / ti.full / "_agent_analysis_errors.json"
+                err_path.parent.mkdir(parents=True, exist_ok=True)
+                err_path.write_text(
+                    __import__("json").dumps(
+                        [{"severity": i.severity, "field": i.field, "message": i.message, "suggestion": i.suggestion} for i in issues],
+                        ensure_ascii=False, indent=2
+                    ),
+                    encoding="utf-8"
+                )
+                if errs:
+                    print(f"   → 详细 issue 写入 {err_path}")
+                    print(f"   → {len(errs)} 条结构性错误，agent 应修正后重跑 stage2")
+        except Exception as _ve:
+            print(f"   ⚠️ schema 校验跳过: {_ve}")
+
     if agent_analysis and agent_analysis.get("agent_reviewed"):
         print(f"\n🧠 Agent 分析已加载 · agent_analysis.json")
         ag_dc = agent_analysis.get("dim_commentary") or {}
