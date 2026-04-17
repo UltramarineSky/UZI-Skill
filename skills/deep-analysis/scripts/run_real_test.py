@@ -684,6 +684,324 @@ def generate_panel(dims_scored: dict, raw: dict) -> dict:
     }
 
 
+# ─────────────────────────────────────────────────────────────
+# v2.6.1 · 自动综合各维度 raw_data 字段为可读 commentary
+# 替代旧版 "[脚本占位]" 废话；让直跑模式（无 agent）也能产出有信息量的报告
+# Agent 介入时仍可覆盖（agent_analysis.dim_commentary 优先级最高）
+# ─────────────────────────────────────────────────────────────
+def _auto_summarize_dim(dim_key: str, label: str, dim: dict, score: float) -> str:
+    """Build a one-paragraph commentary from raw_data fields. NEVER returns
+    "[占位]" type strings — either real content or empty."""
+    if not isinstance(dim, dict):
+        return ""
+    data = dim.get("data") or {}
+    if not data:
+        return f"{label}：未拉取到数据（fetcher 失败或返回空）。"
+
+    def _v(*keys, default="—"):
+        for k in keys:
+            v = data.get(k)
+            if v not in (None, "", "—", "-", [], {}):
+                return v
+        return default
+
+    def _join_list(lst, max_n=3, sep="；"):
+        if not isinstance(lst, list) or not lst:
+            return None
+        out = []
+        for x in lst[:max_n]:
+            if isinstance(x, dict):
+                t = x.get("title") or x.get("name") or x.get("date") or str(x)
+                out.append(str(t)[:50])
+            else:
+                out.append(str(x)[:50])
+        return sep.join(out)
+
+    # ─── Per-dim auto summarizer ───
+    if dim_key == "0_basic":
+        return f"{label}：{_v('name')}（{_v('code')}），{_v('industry')} 行业。市值 {_v('market_cap')}，PE {_v('pe_ttm')}，PB {_v('pb')}。"
+
+    if dim_key == "1_financials":
+        roe = _v("roe_latest", "roe")
+        rev_g = _v("revenue_growth_yoy", "revenue_yoy")
+        np_g = _v("net_profit_yoy")
+        margin = _v("net_margin", "gross_margin")
+        return f"{label}：ROE {roe}，营收同比 {rev_g}，净利同比 {np_g}，净利率 {margin}。综合得分 {score}/10。"
+
+    if dim_key == "2_kline":
+        stage = _v("stage", "wyckoff_stage")
+        ma = _v("ma_align", "trend")
+        macd = _v("macd")
+        return f"{label}：{stage} · 均线 {ma} · MACD {macd}。"
+
+    if dim_key == "3_macro":
+        return (f"{label}：利率周期 {_v('rate_cycle')}；汇率 {_v('fx_trend')}；"
+                f"地缘 {_v('geo_risk')}；大宗商品 {_v('commodity', 'commodity_trend')}。"
+                f"得分 {score}/10。")
+
+    if dim_key == "4_peers":
+        rank = _v("rank")
+        peer_table = data.get("peer_table") or []
+        ind = _v("industry")
+        peers_str = _join_list([p.get("name") for p in peer_table if isinstance(p, dict) and not p.get("is_self")][:5], max_n=5, sep="、")
+        return f"{label}：{ind} 行业，{rank}{('，主要同行：' + peers_str) if peers_str else ''}。得分 {score}/10。"
+
+    if dim_key == "5_chain":
+        return f"{label}：上游 {_v('upstream')}；下游 {_v('downstream')}；客户集中度 {_v('client_concentration')}。"
+
+    if dim_key == "6_research":
+        rep_count = _v("report_count", "n_reports")
+        target = _v("avg_target_price", "target_price")
+        rating = _v("consensus_rating", "rating")
+        return f"{label}：近期券商研报 {rep_count} 篇，一致评级 {rating}，目标价均值 {target}。"
+
+    if dim_key == "7_industry":
+        ind_pe = _v("industry_pe_weighted") or (data.get("cninfo_metrics") or {}).get("industry_pe_weighted")
+        ind_count = _v("total_companies") or (data.get("cninfo_metrics") or {}).get("company_count")
+        growth = _v("growth")
+        return f"{label}：所属 {_v('industry')} · 行业 PE 加权 {ind_pe} · 上市公司数 {ind_count} · 增速 {growth}。"
+
+    if dim_key == "8_materials":
+        core = _v("core_material")
+        trend = _v("price_trend")
+        cost = _v("cost_share")
+        return f"{label}：核心原料 {core}；近期价格走势 {trend}；占成本比例 {cost}。"
+
+    if dim_key == "9_futures":
+        contract = _v("linked_contract")
+        ftrend = _v("contract_trend")
+        return f"{label}：关联合约 {contract}；近期走势 {ftrend}；{_v('note', default='')}。"
+
+    if dim_key == "10_valuation":
+        pe_q = _v("pe_quantile_5y", "pe_quantile")
+        pb_q = _v("pb_quantile_5y", "pb_quantile")
+        return f"{label}：PE 5 年分位 {pe_q}，PB 5 年分位 {pb_q}。得分 {score}/10。"
+
+    if dim_key == "11_governance":
+        ctrl = _v("actual_controller")
+        recent = _v("recent_changes", "recent_holdings_change")
+        return f"{label}：实控人 {ctrl}；近期变动 {recent}。"
+
+    if dim_key == "12_capital_flow":
+        north = _v("north_holding_pct", "north_change_5d", default=None)
+        margin = _v("margin_balance", default=None)
+        if north or margin:
+            return f"{label}：北向持股 {north or '—'}；融资余额 {margin or '—'}。"
+        return f"{label}：{_v('_note', default='资金面数据有限')}。"
+
+    if dim_key == "13_policy":
+        snippets = data.get("snippets") or {}
+        non_empty = {k: v for k, v in snippets.items() if v}
+        if non_empty:
+            preview = "；".join(f"{k}: {len(v) if isinstance(v, list) else 1} 条" for k, v in non_empty.items())
+            return f"{label}：{_v('industry', default='本行业')} {_v('year', default='')} 年政策检索：{preview}。"
+        return f"{label}：{_v('industry', default='本行业')} 政策搜索未命中具体内容（建议 web_search 补抓）。"
+
+    if dim_key == "14_moat":
+        scores = data.get("scores") or {}
+        total = sum(scores.values()) if scores else None
+        if total is not None:
+            return f"{label}：四力评分 无形资产 {scores.get('intangible')}/10、转换成本 {scores.get('switching')}/10、网络效应 {scores.get('network')}/10、规模 {scores.get('scale')}/10 · 综合 {total}/40。"
+        return f"{label}：评估数据有限，得分 {score}/10。"
+
+    if dim_key == "15_events":
+        timeline = data.get("event_timeline") or []
+        recent_news = data.get("recent_news") or []
+        if timeline:
+            head = "；".join([str(t)[:60] for t in timeline[:3]])
+            return f"{label}：近期事件 {len(timeline)} 条，含：{head}。"
+        if recent_news:
+            head = "；".join([(n.get("title") or "")[:60] for n in recent_news[:3]])
+            return f"{label}：近期新闻 {len(recent_news)} 条，含：{head}。"
+        return f"{label}：暂无显著事件（fetcher 返回空）。"
+
+    if dim_key == "16_lhb":
+        n = _v("recent_lhb_count", "n_lhb_30d", default=None)
+        seats = data.get("recent_seats") or data.get("top_seats") or []
+        if n or seats:
+            seat_str = "、".join([s.get("name", "") for s in seats[:3] if isinstance(s, dict)]) if seats else ""
+            return f"{label}：近 30 天上榜 {n or '—'} 次{('，主要席位：' + seat_str) if seat_str else ''}。"
+        return f"{label}：近期未上龙虎榜或非 A 股。"
+
+    if dim_key == "17_sentiment":
+        hot = _v("hot_rank", "hot_score")
+        senti = _v("sentiment_label", "sentiment")
+        return f"{label}：热度 {hot}；情绪 {senti}。"
+
+    if dim_key == "18_trap":
+        level = _v("trap_level", "level")
+        n_signals = _v("hit_signals_count", default=0)
+        rec = _v("recommendation")
+        return f"{label}：{level}；命中信号 {n_signals} 条；建议：{rec}。"
+
+    if dim_key == "19_contests":
+        cnt = _v("contests_count", default=None)
+        if cnt:
+            return f"{label}：实盘比赛上榜 {cnt} 次。"
+        return f"{label}：暂未上榜实盘比赛。"
+
+    # Default: just enumerate top fields
+    items = []
+    for k, v in list(data.items())[:5]:
+        if v not in (None, "", "—", "-", [], {}) and not str(k).startswith("_"):
+            items.append(f"{k}={str(v)[:30]}")
+    return f"{label}：{'、'.join(items) if items else '无数据'}。" if items else ""
+
+
+def _autofill_qualitative_via_mx(raw: dict, ticker: str) -> None:
+    """v2.6.1 · 自动补齐 6 个定性维度的空字段（in-place 修改 raw['dimensions']）.
+
+    优先级：MX 妙想 API → ddgs WebSearch → 显式标记 autofill_failed。
+    适用场景：直跑模式（无 agent 介入），fetcher 拿到空数据时不能让报告也空。
+    """
+    try:
+        from lib.mx_api import MXClient
+    except ImportError:
+        MXClient = None
+    try:
+        from lib.web_search import search as _ws_search
+    except ImportError:
+        _ws_search = None
+
+    client = MXClient() if MXClient else None
+    mx_ok = client is not None and client.available
+    if not mx_ok and not _ws_search:
+        print("   ⚠️ MX_APIKEY 未设置且 ddgs 不可用，跳过自动兜底")
+        return
+
+    dims = raw.get("dimensions", {})
+    basic = (dims.get("0_basic") or {}).get("data") or {}
+    name = basic.get("name") or ticker
+    industry = basic.get("industry") or "综合"
+    code_raw = ticker.split(".")[0] if "." in ticker else ticker
+
+    def _is_default_or_empty(v) -> bool:
+        """True if value is missing OR a generic-default placeholder."""
+        if v in (None, "", "—", "-", [], {}, "n/a", "N/A"):
+            return True
+        s = str(v)
+        # 这些都是 fetcher 的默认 fallback 字符串，没真实信息量
+        if any(kw in s for kw in ["中性（", "中性(", "未拉取", "未命中", "无直接关联"]):
+            return True
+        return False
+
+    # 6 个定性维度的"空判定" + MX query 模板（v2.6.1 加严：默认值也算空）
+    targets = [
+        ("3_macro",     lambda d: all(_is_default_or_empty(d.get(k)) for k in ("rate_cycle","fx_trend","geo_risk","commodity")),
+                        lambda: f"{industry} 2026 宏观环境 利率周期 汇率 大宗商品 行业影响"),
+        ("7_industry",  lambda d: _is_default_or_empty(d.get("growth")) and not (d.get("cninfo_metrics") or {}).get("industry_pe_weighted"),
+                        lambda: f"{industry} 2026 行业增速 TAM 市场规模 渗透率"),
+        ("8_materials", lambda d: _is_default_or_empty(d.get("core_material")),
+                        lambda: f"{name} {code_raw} 主营业务 主要原材料 成本构成"),
+        ("9_futures",   lambda d: _is_default_or_empty(d.get("linked_contract")) or "无直接" in str(d.get("linked_contract","")),
+                        lambda: f"{industry} 行业 上下游 期货品种 套保 大宗"),
+        ("13_policy",   lambda d: not any((d.get("snippets") or {}).get(k) for k in ("policy_dir","subsidy","monitoring","anti_trust")),
+                        lambda: f"{industry} 2026 国家政策 监管动态 补贴 税收 影响"),
+        ("15_events",   lambda d: not d.get("event_timeline") and not d.get("recent_news") and not d.get("recent_notices"),
+                        lambda: f"{name} {code_raw} 最新公告 重大事件 业绩 合同"),
+    ]
+    fixed_count = 0
+    skipped_full = 0
+    failed_count = 0
+    for dim_key, is_empty_fn, query_fn in targets:
+        dim = dims.get(dim_key) or {}
+        data = dim.get("data") or {}
+        try:
+            if not is_empty_fn(data):
+                skipped_full += 1
+                continue  # 该维度已有真实数据
+        except Exception:
+            skipped_full += 1
+            continue
+
+        query = query_fn()
+        text = ""
+        source_used = None
+
+        # 优先 MX
+        if mx_ok:
+            try:
+                r = client.query(query)
+                text = _extract_mx_text(r)
+                if text:
+                    source_used = "mx_api"
+            except Exception:
+                pass
+
+        # 回退 ddgs WebSearch
+        if not text and _ws_search:
+            try:
+                results = _ws_search(query, max_results=3) or []
+                snippets = []
+                for r in results[:3]:
+                    if isinstance(r, dict):
+                        title = (r.get("title") or "").strip()
+                        body = (r.get("body") or "").strip()
+                        if title or body:
+                            snippets.append(f"{title} — {body[:80]}".strip(" —"))
+                text = "；".join(snippets)[:300]
+                if text:
+                    source_used = "ddgs"
+            except Exception:
+                pass
+
+        if text:
+            data.setdefault("_autofill", {})
+            data["_autofill"]["query"] = query
+            data["_autofill"]["snippet"] = text
+            data["_autofill"]["source"] = source_used
+            # 把内容塞到对应字段，方便 _auto_summarize_dim 摘要
+            if dim_key == "3_macro":
+                data["rate_cycle"] = (text[:80] + "…") if len(text) > 80 else text
+            elif dim_key == "7_industry":
+                data["growth"] = (text[:80] + "…") if len(text) > 80 else text
+            elif dim_key == "8_materials":
+                data["core_material"] = (text[:60] + "…") if len(text) > 60 else text
+            elif dim_key == "9_futures":
+                data["contract_trend"] = (text[:60] + "…") if len(text) > 60 else text
+            elif dim_key == "13_policy":
+                snippets = data.setdefault("snippets", {})
+                snippets.setdefault("policy_dir", []).append({"title": text[:120], "url": "", "source": source_used})
+            elif dim_key == "15_events":
+                data["event_timeline"] = [text[:120]]
+            dims[dim_key] = {"ticker": ticker, "data": data,
+                             "source": (dim.get("source", "") + f"+autofill:{source_used}").lstrip("+"),
+                             "fallback": True}
+            fixed_count += 1
+            print(f"   ✓ {dim_key:14s} via {source_used}: {text[:60]}{'…' if len(text)>60 else ''}")
+        else:
+            data["_autofill_failed"] = {"query": query, "reason": "MX/ddgs 都没有返回内容"}
+            dims[dim_key] = {"ticker": ticker, "data": data,
+                             "source": (dim.get("source", "") + "+autofill_failed").lstrip("+"),
+                             "fallback": True}
+            failed_count += 1
+            print(f"   ⚠️ {dim_key:14s} 兜底失败 · agent 应主动 web search 补抓")
+
+    print(f"   合计 · 充足 {skipped_full} · 兜底成功 {fixed_count} · 失败 {failed_count}（共 6 维）")
+
+
+def _extract_mx_text(result: dict) -> str:
+    """Pull most readable text from MX query response.
+    First tries dataTableDTOList[].title + entityName; else returns empty."""
+    if not isinstance(result, dict) or result.get("error"):
+        return ""
+    data = result.get("data") or {}
+    inner = data.get("data") or {}
+    sr = inner.get("searchDataResultDTO") or {}
+    dto_list = sr.get("dataTableDTOList") or []
+    if not dto_list:
+        # Try inner.entityName as last resort
+        return str(inner.get("entityName") or "")[:200]
+    parts = []
+    for dto in dto_list[:2]:
+        if not isinstance(dto, dict):
+            continue
+        title = dto.get("title") or dto.get("entityName") or ""
+        if title:
+            parts.append(str(title)[:120])
+    return "；".join(parts)[:300] if parts else ""
+
+
 def generate_synthesis(raw: dict, dims_scored: dict, panel: dict, agent_analysis: dict | None = None) -> dict:
     """Generate synthesis — merges agent_analysis.json if provided.
 
@@ -866,19 +1184,32 @@ def generate_synthesis(raw: dict, dims_scored: dict, panel: dict, agent_analysis
     agent_core_conclusion = narrative_override.get("core_conclusion") or ""
     core_conclusion = agent_core_conclusion or f"{name} · {int(overall)} 分 · {verdict_label}。51 位大佬里 {panel['signal_distribution']['bullish']} 人看多，YTD {ytd_return}。{punchline}"
 
-    # v2.2 · dim_commentary: prefer agent-written, fallback to stub
+    # v2.2 · dim_commentary: prefer agent-written, fallback to AUTO-SUMMARY (v2.6.1)
+    # 关键修复：原 fallback 只生成 "[脚本占位]" 字符串，导致直跑模式下报告里
+    # 5/6 定性维度是 missing/占位文字。新版直接把 raw_data 字段综合成实际中文。
     agent_dim_commentary = ag.get("dim_commentary") or {}
     dim_commentary_final: dict[str, str] = {}
     dim_labels = {
         "0_basic": "基础信息",
         "1_financials": "财报",
         "2_kline": "K线技术面",
-        "10_valuation": "估值分位",
+        "3_macro": "宏观环境",
         "4_peers": "同行对比",
         "5_chain": "产业链",
+        "6_research": "券商研报",
         "7_industry": "行业景气",
+        "8_materials": "原材料",
+        "9_futures": "期货关联",
+        "10_valuation": "估值分位",
+        "11_governance": "治理/减持",
+        "12_capital_flow": "资金面",
+        "13_policy": "政策与监管",
         "14_moat": "护城河",
+        "15_events": "事件驱动",
+        "16_lhb": "龙虎榜",
+        "17_sentiment": "舆情",
         "18_trap": "杀猪盘",
+        "19_contests": "实盘比赛",
     }
     for dim_key, label in dim_labels.items():
         # Agent-written commentary takes priority
@@ -887,9 +1218,10 @@ def generate_synthesis(raw: dict, dims_scored: dict, panel: dict, agent_analysis
         else:
             dim = (raw.get("dimensions", {}).get(dim_key) or {})
             score_info = dims_scored.get("dimensions", {}).get(dim_key) or {}
-            if dim.get("data"):
-                score = score_info.get("score", 0)
-                dim_commentary_final[dim_key] = f"[脚本占位] {label} 得分 {score}/10 · 需 Claude 补充定性评语"
+            score = score_info.get("score", 0)
+            auto = _auto_summarize_dim(dim_key, label, dim, score)
+            if auto:
+                dim_commentary_final[dim_key] = auto
 
     return {
         "ticker": raw["ticker"],
@@ -1069,6 +1401,16 @@ def stage1(ticker: str) -> dict:
         print(f"   仍拿不到的字段 → 在 agent_analysis.json 显式标 data_gap_acknowledged")
         print(f"   HTML 报告会对这些字段显示 ⚠️ 橙色徽章而非假数据")
         print(f"{'▓' * 50}")
+
+    # v2.6.1 · 自动兜底补齐 6 个定性维度的空字段（不等 agent）
+    # 论坛反馈：直跑模式下"宏观/政策/原材料"这些经常空，agent 没介入就出空报告
+    # 优先 MX API，失败 fallback ddgs；都失败时显式标 _autofill_failed
+    print("\n🤖 v2.6.1 · 自动兜底补齐定性维度空字段（MX → ddgs）...")
+    try:
+        _autofill_qualitative_via_mx(raw, ti.full)
+        write_task_output(ti.full, "raw_data", raw)  # 持久化补齐后的数据
+    except Exception as _af_e:
+        print(f"   ⚠️ 自动兜底异常: {type(_af_e).__name__}: {str(_af_e)[:120]}")
 
     print("\n🏛  Task 1.5 · 机构级财务建模 (Dims 20-22)")
     from compute_deep_methods import compute_dim_20, compute_dim_21, compute_dim_22
