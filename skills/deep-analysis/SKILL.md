@@ -46,6 +46,41 @@ description: 个股深度分析的核心工作流。当用户要求"深度分析
 唯一例外：用户原话含"自动选最相近的"或明确说"就是 Top1" — 此时可以不问
 </HARD-GATE>
 
+### ⛔ HARD-GATE-QUALITATIVE · 6 维定性维度必须 agent 深度分析（v2.4）
+
+<HARD-GATE>
+在 stage2 之前，**3_macro / 7_industry / 8_materials / 9_futures / 13_policy / 15_events**
+这 6 个定性维度必须由 agent 做跨域联想 + 多源抓取后产出结构化分析，不得直接用爬虫片段
+拼到 dim_commentary 里。
+
+**强制流程**（详见 `references/task2.5-qualitative-deep-dive.md`）：
+
+1. 读 `task2.5-qualitative-deep-dive.md` — 这是详尽操作手册（6 维每维 4-7 问、6 条跨域
+   因果链、各维度浏览器 URL 模板、输出 schema）
+2. **Spawn 3 个并行 sub-agent**（Agent tool · subagent_type=general-purpose）：
+   - **A · Macro-Policy**：3_macro + 13_policy
+   - **B · Industry-Events**：7_industry + 15_events
+   - **C · Cost-Transmission**：8_materials + 9_futures
+3. 每个 sub-agent 必须使用：
+   - `WebSearch`（精确到公司名 + 代码 + 行业关键词）
+   - `Chrome/Playwright MCP`（打开 cninfo/xueqiu/gov.cn/证监会/工信部 抓原文）
+   - `mx_api.MXClient`（若 `MX_APIKEY` 已设置）
+4. 合并三个 sub-agent 的输出，写入 `.cache/{ticker}/agent_analysis.json` 的
+   `qualitative_deep_dive` 字段（schema 见 task2.5 第 5 节）
+5. **质量硬红线**：
+   - 每维 `evidence` ≥ 2 条且每条必有具体 URL
+   - 6 维合计 ≥ 3 条 `associations`（跨域因果链，对应 task2.5 第 3 节的 6 条里选 3）
+   - `dim_commentary` 每句必须 cite `qualitative_deep_dive.*.evidence[*].url` 之一
+
+**绝对禁止**：
+- 单 agent 串行覆盖 6 维（必须 3 个并行 sub-agent）
+- 把 raw_data 的爬虫片段直接粘贴当 commentary
+- evidence 为空、url 空字符串、或仅用"值得关注/基本面良好/需要观察"这三个废话词
+- 跳过 task2.5 的问题清单自由发挥
+
+用户要求原话："不能只靠数据爬取，必须要 agent 介入高强度分析 + 多 agent 操作一定要加入进去"
+</HARD-GATE>
+
 ### ⛔ HARD-GATE-DATAGAPS · 数据缺口 agent 必须接管（v2.3）
 
 <HARD-GATE>

@@ -1007,6 +1007,21 @@ def stage2(ticker: str) -> str:
         print(f"   panel_insights: {'✓' if agent_analysis.get('panel_insights') else '✗'}")
         print(f"   narrative_override: {'✓' if agent_analysis.get('narrative_override') else '✗'}")
         print(f"   great_divide_override: {'✓' if agent_analysis.get('great_divide_override') else '✗'}")
+
+        # v2.4 · HARD-GATE-QUALITATIVE 校验（仅警示，不 abort）
+        qd = agent_analysis.get("qualitative_deep_dive") or {}
+        required_dims = ("3_macro", "7_industry", "8_materials", "9_futures", "13_policy", "15_events")
+        missing_qd = [d for d in required_dims if d not in qd or not qd[d].get("evidence")]
+        total_evidence = sum(len((qd.get(d) or {}).get("evidence") or []) for d in required_dims)
+        total_assoc = sum(len((qd.get(d) or {}).get("associations") or []) for d in required_dims)
+        if missing_qd:
+            print(f"   ⚠️  qualitative_deep_dive: 缺失 {len(missing_qd)}/6 维 ({','.join(missing_qd)})")
+            print(f"      → 参考 references/task2.5-qualitative-deep-dive.md")
+            print(f"      → 应 spawn 3 个并行 sub-agent (Macro-Policy / Industry-Events / Cost-Transmission)")
+        else:
+            print(f"   qualitative_deep_dive: ✓ 6 维全覆盖 · evidence {total_evidence} 条 · associations {total_assoc} 条")
+            if total_assoc < 3:
+                print(f"   ⚠️  跨域因果链仅 {total_assoc} 条，task2.5 要求 ≥ 3 条")
     else:
         print(f"\n⚠️  未检测到 agent_analysis.json · 将使用脚本骨架生成 synthesis")
         print(f"   提示: Claude agent 应在 stage1 之后写入 .cache/{ti.full}/agent_analysis.json")
